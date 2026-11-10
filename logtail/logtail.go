@@ -587,7 +587,7 @@ func (lg *Logger) internetUp() bool {
 // onChangeDelta is an eventbus subscriber function that handles
 // [netmon.ChangeDelta] events to detect whether the Internet is expected to be
 // reachable.
-func (lg *Logger) onChangeDelta(delta *netmon.ChangeDelta) {
+func (lg *Logger) onChangeDelta(delta netmon.ChangeDelta) {
 	if delta.AnyInterfaceUp() {
 		fmt.Fprintf(lg.stderr, "logtail: internet back up\n")
 		lg.networkIsUp.Set()
