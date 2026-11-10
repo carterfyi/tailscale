@@ -42,8 +42,9 @@ type client struct {
 	byConnKey       map[key.NodePublic]set.Set[netip.Prefix]
 }
 
-// transitIPForMagicIP is part of the implementation of the [Conn25Datapath] interface for dataflow lookups.
-// See also [Conn25Datapath.ClientTransitIPForMagicIP].
+// transitIPForMagicIP is a pure lookup of the Transit IP currently assigned to
+// magicIP. See also [Conn25.ClientTransitIPForMagicIP]. Callers that are about
+// to install a flow must use [client.flowCreatedForMagicIP] instead.
 func (c *client) transitIPForMagicIP(magicIP netip.Addr) (netip.Addr, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -280,16 +281,27 @@ func (c *client) enqueueAddressAssignment(addrs *addrs) error {
 	}
 }
 
-func (c *client) flowCreated(transit netip.Addr) func() {
+// flowCreatedForMagicIP resolves magicIP to the transit IP currently assigned
+// to it and records that a flow is being established against that assignment,
+// returning the transit IP and the cleanup that releases the flow's hold on it.
+// It reports whether magicIP had an assignment at all.
+//
+// Resolving and counting share one critical section deliberately. Done as two
+// steps, a concurrent [client.reserveAddresses] can expire the assignment in
+// between and hand its transit IP to an unrelated destination, leaving the
+// caller to install a flow that forwards to a transit IP the assignment no
+// longer owns.
+func (c *client) flowCreatedForMagicIP(magicIP netip.Addr) (netip.Addr, func(), bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry, ok := c.assignments.byTransitIP[transit]
+	entry, ok := c.assignments.lookupByMagicIP(magicIP)
 	if !ok {
-		return func() {}
+		return netip.Addr{}, func() {}, false
 	}
+	transit := entry.connectorAddr.transit
 	entry.activeFlowCount++
 	var released bool
-	return func() {
+	return transit, func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if released {
@@ -304,7 +316,7 @@ func (c *client) flowCreated(transit netip.Addr) func() {
 		if entry.activeFlowCount == 0 {
 			entry.zeroFlowTime = c.assignments.clock.Now()
 		}
-	}
+	}, true
 }
 
 func (c *client) extraWireGuardAllowedIPs(k key.NodePublic) views.Slice[netip.Prefix] {
