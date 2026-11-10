@@ -18,9 +18,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
 	"tailscale.com/cmd/k8s-operator/e2e/internal/build"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
@@ -38,11 +40,11 @@ const (
 // testResource is one resource under test, with checks reusable before and after
 // the version change. All func fields are optional (nil => skipped) except waitReady.
 type testResource struct {
-	name       string
-	waitReady  func(t *testing.T)
-	dataPath   func(t *testing.T) // traffic probe.
-	extraCheck func(t *testing.T)
-	objConds   func(t *testing.T) (conds []metav1.Condition, ok bool)
+	name           string
+	waitReady      func(t *testing.T)
+	reconcileCheck func(t *testing.T) // asserts the operator reconciled the correct managed objects/config.
+	trafficCheck   func(t *testing.T) // sends real traffic through the resource.
+	objConds       func(t *testing.T) (conds []metav1.Condition, ok bool)
 	// primaryCond is the Ready condition watched for flapping.
 	primaryCond tsapi.ConditionType
 	// secondaryConds are other conditions that must also be True.
@@ -52,15 +54,15 @@ type testResource struct {
 
 // condProbe reads the resource's primary Ready condition, or ok=false
 // if it can't be read yet (treated as "no observation", not a flip).
-func (m testResource) condProbe(t *testing.T) (metav1.Condition, bool) {
-	if m.objConds == nil || m.primaryCond == "" {
+func (r testResource) condProbe(t *testing.T) (metav1.Condition, bool) {
+	if r.objConds == nil || r.primaryCond == "" {
 		return metav1.Condition{}, false
 	}
-	conds, ok := m.objConds(t)
+	conds, ok := r.objConds(t)
 	if !ok {
 		return metav1.Condition{}, false
 	}
-	return findCond(conds, m.primaryCond)
+	return findCond(conds, r.primaryCond)
 }
 
 // TestOperatorVersionChange provisions operator resources at --from-version, then
@@ -99,23 +101,16 @@ func TestOperatorVersionChange(t *testing.T) {
 		t.Fatalf("--round-trip requires --from-version (%s) older than --to-version (%s): it installs the baseline, upgrades to the candidate, then rolls back", fromVer, toVer)
 	}
 
-	const minVersion = "v1.102.5"
-	older := fromVer
-	if semver.Compare(toVer, older) < 0 {
-		older = toVer
-	}
-	if semver.Compare(older, minVersion) < 0 {
-		t.Fatalf("version %s is below the minimum supported %s", older, minVersion)
-	}
+	crdAvailable, crdHasField := crdSupportForVersions(t, fromDir, toDir)
 
-	crdAvailable, crdHasField := crdIntersection(t, fromDir, toDir)
-
-	t.Logf("provisioning operator at %q (%s)", fromVer, fromDir)
+	start := time.Now()
+	t.Logf("provisioning baseline operator %s from %s (builds and side-loads images; interleaved build and tsnet logs below are expected)", fromVer, fromDir)
 	cleanup, err := provisionOperatorStack(ctx, e2eLogger, fromDir)
 	if err != nil {
 		t.Fatalf("provisioning operator at %q: %v", fromVer, err)
 	}
 	t.Cleanup(cleanup)
+	t.Logf("baseline operator %s provisioned in %s", fromVer, time.Since(start).Round(time.Second))
 
 	resources := createResources(t, crdAvailable, crdHasField)
 
@@ -198,11 +193,11 @@ func versionInWorktree(t *testing.T, dir string) string {
 func runResourceChecks(t *testing.T, r testResource, postChange bool) {
 	r.waitReady(t)
 	requireSecondaryConds(t, r)
-	if r.extraCheck != nil {
-		r.extraCheck(t)
+	if r.reconcileCheck != nil {
+		r.reconcileCheck(t)
 	}
-	if r.dataPath != nil {
-		r.dataPath(t)
+	if r.trafficCheck != nil {
+		r.trafficCheck(t)
 	}
 	if postChange && r.postChangeCheck != nil {
 		r.postChangeCheck(t)
@@ -228,30 +223,8 @@ func worktreeForRef(t *testing.T, ctx context.Context, ref string) (string, func
 	return dir, cleanup
 }
 
-func proxyGroupResource(label, pgName string, extra ...tsapi.ConditionType) testResource {
-	return testResource{
-		name:           label + "/" + pgName,
-		waitReady:      func(t *testing.T) { waitForProxyGroupReady(t, pgName) },
-		objConds:       proxyGroupObjConds(pgName),
-		primaryCond:    tsapi.ProxyGroupReady,
-		secondaryConds: append([]tsapi.ConditionType{tsapi.ProxyGroupAvailable}, extra...),
-	}
-}
-
-func pgEgressServiceResource(label, svcName string) testResource {
-	return testResource{
-		name:           label + "/" + svcName,
-		waitReady:      func(t *testing.T) { waitForEgress(t, svcName, pgEgressReady) },
-		extraCheck:     func(t *testing.T) { requireEgressEndpointSlicesHealthy(t, svcName) },
-		dataPath:       func(t *testing.T) { requireTargetIsReachable(t, egressURL(svcName)) },
-		objConds:       serviceObjConds(svcName),
-		primaryCond:    tsapi.EgressSvcReady,
-		secondaryConds: []tsapi.ConditionType{tsapi.EgressSvcConfigured, tsapi.EgressSvcValid},
-	}
-}
-
 // createResources provisions the test resources on the (already installed)
-// from-version and returns themp. IP-family-specific resources are gated on
+// from-version and returns them. IP-family-specific resources are gated on
 // clusterIPv4Support/clusterIPv6Support.
 //
 // A resource whose CRD or required field is absent in either version is omitted
@@ -309,11 +282,11 @@ func createResources(t *testing.T, crdAvailable func(plural string) bool, crdHas
 	})
 	createAndCleanup(t, kubeClient, singletonEgress)
 	resources = append(resources, testResource{
-		name:        "egress-singleton/" + singletonEgress.Name,
-		waitReady:   func(t *testing.T) { waitForEgress(t, singletonEgress.Name, tsoperator.SvcIsReady) },
-		dataPath:    func(t *testing.T) { requireTargetIsReachable(t, egressURL(singletonEgress.Name)) },
-		objConds:    serviceObjConds(singletonEgress.Name),
-		primaryCond: tsapi.ProxyReady,
+		name:         "egress-singleton",
+		waitReady:    func(t *testing.T) { waitForEgress(t, singletonEgress.Name, tsoperator.SvcIsReady) },
+		trafficCheck: func(t *testing.T) { requireTargetIsReachable(t, egressURL(singletonEgress.Name)) },
+		objConds:     serviceObjConds(singletonEgress.Name),
+		primaryCond:  tsapi.ProxyReady,
 	})
 
 	const subnetRoute = "10.40.0.0/14"
@@ -363,13 +336,13 @@ func createResources(t *testing.T, crdAvailable func(plural string) bool, crdHas
 			},
 		}
 		createAndCleanup(t, kubeClient, multiTNCn)
-		m := connectorResource("connector-multi-tailnet", multiTNCn.Name)
-		m.extraCheck = func(t *testing.T) {
+		r := connectorResource("connector-multi-tailnet", multiTNCn.Name)
+		r.reconcileCheck = func(t *testing.T) {
 			if err := verifyConnectorTailnet(t, multiTNCn, secondTNClient); err != nil {
 				t.Fatalf("multi-tailnet Connector %s not on the second tailnet: %v", multiTNCn.Name, err)
 			}
 		}
-		resources = append(resources, m)
+		resources = append(resources, r)
 	}
 
 	switch {
@@ -391,9 +364,9 @@ func createResources(t *testing.T, crdAvailable func(plural string) bool, crdHas
 		}
 		createAndCleanup(t, kubeClient, pr)
 		resources = append(resources, testResource{
-			name:      "peerrelay/" + pr.Name,
+			name:      "peerrelay",
 			waitReady: func(t *testing.T) { waitForPeerRelayReady(t, pr.Name) },
-			extraCheck: func(t *testing.T) {
+			reconcileCheck: func(t *testing.T) {
 				verifyPeerRelayStatusEndpoints(t, pr.Name, 1, wantEndpoints)
 				verifyPeerRelayReplica(t, pr.Name, 0, peerRelayPort, wantEndpoints)
 			},
@@ -419,18 +392,23 @@ func createResources(t *testing.T, crdAvailable func(plural string) bool, crdHas
 	}
 	createAndCleanup(t, kubeClient, customPC)
 	resources = append(resources, testResource{
-		name:        "proxyclass-custom/" + customPC.Name,
+		name:        "proxyclass-custom",
 		waitReady:   func(t *testing.T) { waitForProxyClassReady(t, customPC.Name) },
 		objConds:    proxyClassObjConds(customPC.Name),
 		primaryCond: tsapi.ProxyClassReady,
 	})
 
+	// An egress ProxyGroup bound to the custom ProxyClass above: the other
+	// ProxyGroups use the default config, so this is the only member that proves
+	// the version change preserves user-defined StatefulSet/Pod overrides (metrics,
+	// env, image-pull policy), which the operator re-applies when it rolls managed
+	// workloads.
 	customPGEgress := &tsapi.ProxyGroup{
 		ObjectMeta: metav1.ObjectMeta{Name: generateName("up-eg-pc")},
 		Spec:       tsapi.ProxyGroupSpec{Type: tsapi.ProxyGroupTypeEgress, ProxyClass: customPC.Name},
 	}
 	createAndCleanup(t, kubeClient, customPGEgress)
-	resources = append(resources, proxyGroupResource("proxygroup-egress-custompc", customPGEgress.Name))
+	resources = append(resources, proxyGroupResource("proxygroup-egress-customproxyclass", customPGEgress.Name))
 
 	nginx := nginxDeployment(ns)
 	createAndCleanup(t, kubeClient, nginx)
@@ -452,7 +430,7 @@ func createResources(t *testing.T, crdAvailable func(plural string) bool, crdHas
 	haIngress := l7Ingress(ns, backend.Name, map[string]string{AnnotationProxyGroup: ingressPG.Name})
 	createAndCleanup(t, kubeClient, haIngress)
 	resources = append(resources, testResource{
-		name: "ingress-l7-ha/" + haIngress.Name,
+		name: "ingress-l7-ha",
 		waitReady: func(t *testing.T) {
 			hostname, err := waitForIngressHostname(t, ns, haIngress.Name)
 			if err != nil {
@@ -467,7 +445,7 @@ func createResources(t *testing.T, crdAvailable func(plural string) bool, crdHas
 	singletonIngress := l7Ingress(ns, backend.Name, nil)
 	createAndCleanup(t, kubeClient, singletonIngress)
 	resources = append(resources, testResource{
-		name: "ingress-l7-singleton/" + singletonIngress.Name,
+		name: "ingress-l7-singleton",
 		waitReady: func(t *testing.T) {
 			hostname, err := waitForIngressHostname(t, ns, singletonIngress.Name)
 			if err != nil {
@@ -486,7 +464,7 @@ func createResources(t *testing.T, crdAvailable func(plural string) bool, crdHas
 	resources = append(resources, testResource{
 		name:      "dnsconfig/dns",
 		waitReady: func(t *testing.T) { waitForDNSConfigReady(t, "dns") },
-		dataPath: func(t *testing.T) {
+		trafficCheck: func(t *testing.T) {
 			hostname, err := waitForIngressHostname(t, ns, dnsIngress.Name)
 			if err != nil {
 				t.Fatalf("waiting for DNS-probe Ingress %s hostname: %v", dnsIngress.Name, err)
@@ -501,11 +479,11 @@ func createResources(t *testing.T, crdAvailable func(plural string) bool, crdHas
 	l3Singleton := l3ExposeService(generateName("up-l3"), nginx.Name, l3Family)
 	createAndCleanup(t, kubeClient, l3Singleton)
 	resources = append(resources, testResource{
-		name:        "ingress-l3-singleton/" + l3Singleton.Name,
-		waitReady:   func(t *testing.T) { waitForEgress(t, l3Singleton.Name, tsoperator.SvcIsReady) },
-		dataPath:    func(t *testing.T) { requireL3ProxyReachable(t, l3Singleton.Name) },
-		objConds:    serviceObjConds(l3Singleton.Name),
-		primaryCond: tsapi.ProxyReady,
+		name:         "ingress-l3-singleton",
+		waitReady:    func(t *testing.T) { waitForEgress(t, l3Singleton.Name, tsoperator.SvcIsReady) },
+		trafficCheck: func(t *testing.T) { requireL3ProxyReachable(t, l3Singleton.Name) },
+		objConds:     serviceObjConds(l3Singleton.Name),
+		primaryCond:  tsapi.ProxyReady,
 	})
 
 	l3HAPG := &tsapi.ProxyGroup{
@@ -518,60 +496,78 @@ func createResources(t *testing.T, crdAvailable func(plural string) bool, crdHas
 	l3HASvc := l3LoadBalancerService(generateName("up-l3ha-svc"), nginx.Name, l3HAPG.Name, l3Family)
 	createAndCleanup(t, kubeClient, l3HASvc)
 	resources = append(resources, testResource{
-		name:        "ingress-l3-ha/" + l3HASvc.Name,
+		name:        "ingress-l3-ha",
 		waitReady:   func(t *testing.T) { waitForL3HAIngressReady(t, l3HASvc.Name) },
 		objConds:    serviceObjConds(l3HASvc.Name),
 		primaryCond: tsapi.IngressSvcConfigured,
 	})
 
-	if !crdHasField("proxygroups", "kubeAPIServer") {
-		t.Log("resources: omitting kube-apiserver ProxyGroup (both versions' CRD need spec.kubeAPIServer)")
-	} else {
-		apiPCName := applyProxyGroupProxyClass(t)
-		apiRoleName := generateName("up-api-crud")
-		createAndCleanup(t, kubeClient, &rbacv1.Role{
-			ObjectMeta: objectMeta(ns, apiRoleName),
-			Rules: []rbacv1.PolicyRule{{
-				APIGroups: []string{""},
-				Verbs:     []string{"get", "list", "create", "update", "delete"},
-				Resources: []string{"configmaps"},
-			}},
-		})
-		createAndCleanup(t, kubeClient, &rbacv1.RoleBinding{
-			ObjectMeta: objectMeta(ns, apiRoleName),
-			Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "ts:e2e-test-proxy"}},
-			RoleRef:    rbacv1.RoleRef{Kind: "Role", Name: apiRoleName},
-		})
-		apiPG := &tsapi.ProxyGroup{
-			ObjectMeta: metav1.ObjectMeta{Name: generateName("up-api")},
-			Spec: tsapi.ProxyGroupSpec{
-				Type:          tsapi.ProxyGroupTypeKubernetesAPIServer,
-				ProxyClass:    apiPCName,
-				KubeAPIServer: &tsapi.KubeAPIServerConfig{Mode: new(tsapi.APIServerProxyModeAuth)},
-			},
-		}
-		createAndCleanup(t, kubeClient, apiPG)
-		apiResource := proxyGroupResource("proxygroup-kube-apiserver", apiPG.Name,
-			tsapi.KubeAPIServerProxyConfigured, tsapi.KubeAPIServerProxyValid)
-		apiResource.dataPath = func(t *testing.T) {
-			proxyURL := waitForKubeAPIServerProxyReady(t, apiPG.Name)
-			proxyCl, err := apiServerProxyClient(proxyURL)
-			if err != nil {
-				t.Fatalf("creating API server proxy client for %s: %v", apiPG.Name, err)
-			}
-			runAPIServerProxyCRUD(t, proxyCl)
-		}
-		resources = append(resources, apiResource)
+	apiPCName := applyProxyGroupProxyClass(t)
+	apiRoleName := generateName("up-api-crud")
+	createAndCleanup(t, kubeClient, &rbacv1.Role{
+		ObjectMeta: objectMeta(ns, apiRoleName),
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Verbs:     []string{"get", "list", "create", "update", "delete"},
+			Resources: []string{"configmaps"},
+		}},
+	})
+	createAndCleanup(t, kubeClient, &rbacv1.RoleBinding{
+		ObjectMeta: objectMeta(ns, apiRoleName),
+		Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "ts:e2e-test-proxy"}},
+		RoleRef:    rbacv1.RoleRef{Kind: "Role", Name: apiRoleName},
+	})
+	apiPG := &tsapi.ProxyGroup{
+		ObjectMeta: metav1.ObjectMeta{Name: generateName("up-api")},
+		Spec: tsapi.ProxyGroupSpec{
+			Type:          tsapi.ProxyGroupTypeKubernetesAPIServer,
+			ProxyClass:    apiPCName,
+			KubeAPIServer: &tsapi.KubeAPIServerConfig{Mode: new(tsapi.APIServerProxyModeAuth)},
+		},
 	}
+	createAndCleanup(t, kubeClient, apiPG)
+	apiResource := proxyGroupResource("proxygroup-kube-apiserver", apiPG.Name,
+		tsapi.KubeAPIServerProxyConfigured, tsapi.KubeAPIServerProxyValid)
+	apiResource.trafficCheck = func(t *testing.T) {
+		proxyURL := waitForKubeAPIServerProxyReady(t, apiPG.Name)
+		proxyCl, err := apiServerProxyClient(proxyURL)
+		if err != nil {
+			t.Fatalf("creating API server proxy client for %s: %v", apiPG.Name, err)
+		}
+		runAPIServerProxyCRUD(t, proxyCl)
+	}
+	resources = append(resources, apiResource)
 
 	// TODO(beckypauley): consider a ProxyGroupPolicy test resource.
 
 	return resources
 }
 
+func proxyGroupResource(label, pgName string, extra ...tsapi.ConditionType) testResource {
+	return testResource{
+		name:           label,
+		waitReady:      func(t *testing.T) { waitForProxyGroupReady(t, pgName) },
+		objConds:       proxyGroupObjConds(pgName),
+		primaryCond:    tsapi.ProxyGroupReady,
+		secondaryConds: append([]tsapi.ConditionType{tsapi.ProxyGroupAvailable}, extra...),
+	}
+}
+
+func pgEgressServiceResource(label, svcName string) testResource {
+	return testResource{
+		name:           label,
+		waitReady:      func(t *testing.T) { waitForEgress(t, svcName, pgEgressReady) },
+		reconcileCheck: func(t *testing.T) { requireEgressEndpointSlicesHealthy(t, svcName) },
+		trafficCheck:   func(t *testing.T) { requireTargetIsReachable(t, egressURL(svcName)) },
+		objConds:       serviceObjConds(svcName),
+		primaryCond:    tsapi.EgressSvcReady,
+		secondaryConds: []tsapi.ConditionType{tsapi.EgressSvcConfigured, tsapi.EgressSvcValid},
+	}
+}
+
 func connectorResource(label, name string) testResource {
 	return testResource{
-		name:        label + "/" + name,
+		name:        label,
 		waitReady:   func(t *testing.T) { waitForConnectorReady(t, name) },
 		objConds:    connectorObjConds(name),
 		primaryCond: tsapi.ConnectorReady,
@@ -640,10 +636,13 @@ func waitForDNSConfigReady(t *testing.T, name string) {
 	}
 }
 
-// crdIntersection returns two predicates over the given version worktrees' CRDs:
-// crdAvailable(plural) reports whether the CRD exists in all versions, and
-// crdHasField(plural, field) whether all versions mention that key.
-func crdIntersection(t *testing.T, dirs ...string) (crdAvailable func(string) bool, crdHasField func(string, string) bool) {
+// crdSupportForVersions compares the CRDs shipped by each version's worktree and
+// returns two helpers for asking what they have in common. createResources uses
+// them to skip any resource whose CRD or field is missing from one version (e.g.
+// a downgrade target that predates a field):
+//   - crdAvailable(plural) reports whether every version ships that CRD.
+//   - crdHasField(plural, field) reports whether every version's CRD has spec.<field>.
+func crdSupportForVersions(t *testing.T, dirs ...string) (crdAvailable func(string) bool, crdHasField func(string, string) bool) {
 	t.Helper()
 	sets := make([]map[string]bool, len(dirs))
 	for i, dir := range dirs {
@@ -659,7 +658,7 @@ func crdIntersection(t *testing.T, dirs ...string) (crdAvailable func(string) bo
 	}
 	crdHasField = func(plural, field string) bool {
 		for _, dir := range dirs {
-			if !crdMentionsKey(t, dir, plural, field) {
+			if !crdSpecHasField(t, dir, plural, field) {
 				return false
 			}
 		}
@@ -668,10 +667,8 @@ func crdIntersection(t *testing.T, dirs ...string) (crdAvailable func(string) bo
 	return crdAvailable, crdHasField
 }
 
-func crdFileName(plural string) string { return "tailscale.com_" + plural + ".yaml" }
-
-// crdsInWorktree returns the set of CRD plurals shipped by the chart at dir,
-// derived from deploy/crds/tailscale.com_<plural>.yaml filenames.
+// crdsInWorktree returns the set of CRD plurals the chart at dir ships, taken
+// from the deploy/crds/tailscale.com_<plural>.yaml filenames.
 func crdsInWorktree(t *testing.T, dir string) map[string]bool {
 	t.Helper()
 	crdDir := filepath.Join(dir, "cmd", "k8s-operator", "deploy", "crds")
@@ -693,9 +690,11 @@ func crdsInWorktree(t *testing.T, dir string) map[string]bool {
 	return out
 }
 
-func crdMentionsKey(t *testing.T, dir, plural, key string) bool {
+// crdSpecHasField reports whether the given resource's CRD (in dir) has the
+// field spec.<field>.
+func crdSpecHasField(t *testing.T, dir, plural, field string) bool {
 	t.Helper()
-	path := filepath.Join(dir, "cmd", "k8s-operator", "deploy", "crds", crdFileName(plural))
+	path := filepath.Join(dir, "cmd", "k8s-operator", "deploy", "crds", "tailscale.com_"+plural+".yaml")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -703,8 +702,19 @@ func crdMentionsKey(t *testing.T, dir, plural, key string) bool {
 		}
 		t.Fatalf("reading CRD %s: %v", path, err)
 	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if strings.TrimSpace(line) == key+":" {
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := yaml.Unmarshal(b, &crd); err != nil {
+		t.Fatalf("parsing CRD %s: %v", path, err)
+	}
+	for _, v := range crd.Spec.Versions {
+		if v.Schema == nil || v.Schema.OpenAPIV3Schema == nil {
+			continue
+		}
+		spec, ok := v.Schema.OpenAPIV3Schema.Properties["spec"]
+		if !ok {
+			continue
+		}
+		if _, ok := spec.Properties[field]; ok {
 			return true
 		}
 	}
@@ -771,36 +781,31 @@ func serviceObjConds(name string) func(*testing.T) ([]metav1.Condition, bool) {
 	}
 }
 
-// requireSecondaryConds asserts every m.secondaryConds condition is present and
-// True, retrying until they settle. Status-only: several are written with
-// observedGeneration=0, so generation isn't matched.
-func requireSecondaryConds(t *testing.T, m testResource) {
+// requireSecondaryConds asserts every r.secondaryConds condition is present and
+// True, retrying until they settle.
+func requireSecondaryConds(t *testing.T, r testResource) {
 	t.Helper()
-	if len(m.secondaryConds) == 0 || m.objConds == nil {
+	if len(r.secondaryConds) == 0 || r.objConds == nil {
 		return
 	}
 	if err := tstest.WaitFor(3*time.Minute, func() error {
-		conds, ok := m.objConds(t)
+		conds, ok := r.objConds(t)
 		if !ok {
-			return fmt.Errorf("%s: conditions not readable yet", m.name)
+			return fmt.Errorf("%s: conditions not readable yet", r.name)
 		}
-		return secondaryCondsHealthy(m.name, conds, m.secondaryConds)
+		for _, w := range r.secondaryConds {
+			c, ok := findCond(conds, w)
+			if !ok {
+				return fmt.Errorf("%s: condition %s not set yet", r.name, w)
+			}
+			if c.Status != metav1.ConditionTrue {
+				return fmt.Errorf("%s: condition %s is %s (reason=%s)", r.name, w, c.Status, c.Reason)
+			}
+		}
+		return nil
 	}); err != nil {
 		t.Fatalf("secondary conditions not healthy: %v", err)
 	}
-}
-
-func secondaryCondsHealthy(name string, conds []metav1.Condition, want []tsapi.ConditionType) error {
-	for _, w := range want {
-		c, ok := findCond(conds, w)
-		if !ok {
-			return fmt.Errorf("%s: condition %s not set yet", name, w)
-		}
-		if c.Status != metav1.ConditionTrue {
-			return fmt.Errorf("%s: condition %s is %s (reason=%s)", name, w, c.Status, c.Reason)
-		}
-	}
-	return nil
 }
 
 func findCond(conds []metav1.Condition, ct tsapi.ConditionType) (metav1.Condition, bool) {
@@ -830,6 +835,10 @@ func requireEgressEndpointSlicesHealthy(t *testing.T, egressSvcName string) {
 		LabelParentType:        "svc",
 		LabelParentName:        egressSvcName,
 	}
+	familyAddrType := map[corev1.IPFamily]discoveryv1.AddressType{
+		corev1.IPv4Protocol: discoveryv1.AddressTypeIPv4,
+		corev1.IPv6Protocol: discoveryv1.AddressTypeIPv6,
+	}
 	if err := tstest.WaitFor(2*time.Minute, func() error {
 		var clusterSvcs corev1.ServiceList
 		if err := kubeClient.List(ctx, &clusterSvcs, client.InNamespace(tsNamespace), parent); err != nil {
@@ -846,67 +855,40 @@ func requireEgressEndpointSlicesHealthy(t *testing.T, egressSvcName string) {
 		if err := kubeClient.List(ctx, &slices, client.InNamespace(tsNamespace), parent); err != nil {
 			return err
 		}
-		return egressSlicesHealthy(egressSvcName, clusterSvcs.Items[0].Spec.IPFamilies, slices.Items)
-	}); err != nil {
-		t.Fatalf("egress EndpointSlices for %s not healthy: %v", egressSvcName, err)
-	}
-}
-
-func egressSlicesHealthy(egressSvcName string, wantFamilies []corev1.IPFamily, slices []discoveryv1.EndpointSlice) error {
-	if len(slices) == 0 {
-		return fmt.Errorf("no managed EndpointSlices for egress Service %s yet", egressSvcName)
-	}
-
-	wantType := map[discoveryv1.AddressType]bool{}
-	for _, f := range wantFamilies {
-		switch f {
-		case corev1.IPv4Protocol:
-			wantType[discoveryv1.AddressTypeIPv4] = true
-		case corev1.IPv6Protocol:
-			wantType[discoveryv1.AddressTypeIPv6] = true
+		if len(slices.Items) == 0 {
+			return fmt.Errorf("no managed EndpointSlices for egress Service %s yet", egressSvcName)
 		}
-	}
 
-	gotType := map[discoveryv1.AddressType]bool{}
-	for _, s := range slices {
-		gotType[s.AddressType] = true
-		if !wantType[s.AddressType] {
-			return fmt.Errorf("EndpointSlice %s has AddressType %s but egress Service %s has no such family (orphaned/stale slice: %v)", s.Name, s.AddressType, egressSvcName, wantFamilies)
+		// The managed EndpointSlices must cover exactly the ClusterIP Service's IP
+		// families: an unexpected family is an orphaned/blackhole slice, a missing
+		// one means no endpoints were programmed for it.
+		want := map[discoveryv1.AddressType]bool{}
+		for _, f := range clusterSvcs.Items[0].Spec.IPFamilies {
+			want[familyAddrType[f]] = true
 		}
-		if len(s.Endpoints) == 0 {
-			return fmt.Errorf("EndpointSlice %s (%s) for %s has no endpoints", s.Name, s.AddressType, egressSvcName)
-		}
-		for _, ep := range s.Endpoints {
-			if len(ep.Addresses) == 0 {
-				return fmt.Errorf("EndpointSlice %s (%s) has an endpoint with no addresses", s.Name, s.AddressType)
+		got := map[discoveryv1.AddressType]bool{}
+		for _, s := range slices.Items {
+			got[s.AddressType] = true
+			if !want[s.AddressType] {
+				return fmt.Errorf("EndpointSlice %s has AddressType %s but egress Service %s has no such family (orphaned/stale slice)", s.Name, s.AddressType, egressSvcName)
 			}
-			for _, addr := range ep.Addresses {
-				if !addressMatchesSliceFamily(addr, s.AddressType) {
-					return fmt.Errorf("EndpointSlice %s declares %s but has address %q of the wrong family (corrupt slice)", s.Name, s.AddressType, addr)
+			if len(s.Endpoints) == 0 {
+				return fmt.Errorf("EndpointSlice %s (%s) for %s has no endpoints", s.Name, s.AddressType, egressSvcName)
+			}
+			for _, ep := range s.Endpoints {
+				if len(ep.Addresses) == 0 {
+					return fmt.Errorf("EndpointSlice %s (%s) has an endpoint with no addresses", s.Name, s.AddressType)
 				}
 			}
 		}
-	}
-	for at := range wantType {
-		if !gotType[at] {
-			return fmt.Errorf("egress Service %s has family for %s but no managed EndpointSlice of that type", egressSvcName, at)
+		for at := range want {
+			if !got[at] {
+				return fmt.Errorf("egress Service %s has family for %s but no managed EndpointSlice of that type", egressSvcName, at)
+			}
 		}
-	}
-	return nil
-}
-
-func addressMatchesSliceFamily(addr string, at discoveryv1.AddressType) bool {
-	ip, err := netip.ParseAddr(addr)
-	if err != nil {
-		return false
-	}
-	switch at {
-	case discoveryv1.AddressTypeIPv4:
-		return ip.Is4()
-	case discoveryv1.AddressTypeIPv6:
-		return ip.Is6() && !ip.Is4In6()
-	default:
-		return true // FQDN or other: don't second-guess.
+		return nil
+	}); err != nil {
+		t.Fatalf("egress EndpointSlices for %s not healthy: %v", egressSvcName, err)
 	}
 }
 
@@ -927,9 +909,9 @@ func requireNoFlapDuringSettle(t *testing.T, resources []testResource) {
 		transitions    int
 	}
 	states := make(map[string]*probeState)
-	for _, m := range resources {
-		if m.primaryCond != "" {
-			states[m.name] = &probeState{}
+	for _, r := range resources {
+		if r.primaryCond != "" {
+			states[r.name] = &probeState{}
 		}
 	}
 	lastRestarts := managedPodRestarts(t)
@@ -939,12 +921,12 @@ func requireNoFlapDuringSettle(t *testing.T, resources []testResource) {
 	for {
 		time.Sleep(tick)
 
-		for _, m := range resources {
-			c, ok := m.condProbe(t)
+		for _, r := range resources {
+			c, ok := r.condProbe(t)
 			if !ok {
 				continue
 			}
-			st := states[m.name]
+			st := states[r.name]
 			if st.lastTransition.IsZero() {
 				st.lastTransition = c.LastTransitionTime
 				continue
@@ -953,7 +935,7 @@ func requireNoFlapDuringSettle(t *testing.T, resources []testResource) {
 				st.transitions++
 				st.lastTransition = c.LastTransitionTime
 				lastChange = time.Now()
-				t.Logf("settle: %s Ready transitioned to %s (reason=%s)", m.name, c.Status, c.Reason)
+				t.Logf("settle: %s Ready transitioned to %s (reason=%s)", r.name, c.Status, c.Reason)
 			}
 		}
 
@@ -968,81 +950,53 @@ func requireNoFlapDuringSettle(t *testing.T, resources []testResource) {
 
 		if time.Since(lastChange) >= quietFor {
 			// Quiet is necessary but not sufficient: a resource that regressed to a
-			// stable non-True (no flapping, no restarts) also produces silence.
-			if bad := nonTrueResources(t, resources); len(bad) > 0 {
+			// stable non-True (no flapping, no restarts) also produces silence, so
+			// report any primary or secondary condition that is readable and not True
+			// (e.g. ProxyGroupAvailable False while Ready stays True).
+			var bad []string
+			for _, r := range resources {
+				if c, ok := r.condProbe(t); ok && c.Status != metav1.ConditionTrue {
+					bad = append(bad, fmt.Sprintf("%s: Ready=%s (reason=%s)", r.name, c.Status, c.Reason))
+				}
+				if r.objConds != nil && len(r.secondaryConds) > 0 {
+					if conds, ok := r.objConds(t); ok {
+						for _, want := range r.secondaryConds {
+							if c, ok := findCond(conds, want); ok && c.Status != metav1.ConditionTrue {
+								bad = append(bad, fmt.Sprintf("%s: %s=%s (reason=%s)", r.name, want, c.Status, c.Reason))
+							}
+						}
+					}
+				}
+			}
+			if len(bad) > 0 {
 				failAll(t, "stack went quiet but a member is not Ready", bad)
 			}
 			t.Logf("stack converged: no transitions or Pod restarts for %s, all resources Ready", quietFor)
 			return
 		}
 		if time.Now().After(deadline) {
-			obs := make([]resourceSettleObservation, 0, len(resources))
-			for _, m := range resources {
-				if m.primaryCond == "" {
+			// A member fails if its Ready condition is readable and not True, or if
+			// it transitioned more than twice (a healthy single update is <=2:
+			// True->False->True).
+			var problems []string
+			for _, r := range resources {
+				if r.primaryCond == "" {
 					continue
 				}
-				c, ok := m.condProbe(t)
-				obs = append(obs, resourceSettleObservation{
-					name:        m.name,
-					readable:    ok,
-					status:      c.Status,
-					reason:      c.Reason,
-					transitions: states[m.name].transitions,
-				})
-			}
-			failAll(t, "stack did not converge", settleProblems(obs, quietFor, window, time.Since(lastChange)))
-		}
-	}
-}
-
-// resourceSettleObservation is a single resource's state at the settle deadline.
-type resourceSettleObservation struct {
-	name        string
-	readable    bool // condProbe returned a condition
-	status      metav1.ConditionStatus
-	reason      string
-	transitions int // Ready transitions observed during the settle window
-}
-
-// settleProblems is the pure decision behind requireNoFlapDuringSettle's deadline
-// path. A member fails if its Ready condition is readable and not True, or if it
-// transitioned more than twice (a healthy single update is <=2: True->False->True).
-func settleProblems(obs []resourceSettleObservation, quietFor, window, sinceLastChange time.Duration) []string {
-	var problems []string
-	for _, o := range obs {
-		if o.readable && o.status != metav1.ConditionTrue {
-			problems = append(problems, fmt.Sprintf("%s: Ready=%s (reason=%s) and still churning (%d transitions)", o.name, o.status, o.reason, o.transitions))
-		} else if o.transitions > 2 {
-			problems = append(problems, fmt.Sprintf("%s: Ready condition transitioned %d times and did not settle", o.name, o.transitions))
-		}
-	}
-	if len(problems) == 0 {
-		problems = append(problems, fmt.Sprintf("stack did not go quiet for %s within %s (last change %s ago)", quietFor, window, sinceLastChange.Round(time.Second)))
-	}
-	return problems
-}
-
-// nonTrueResources describes each resource whose primary or any secondary
-// condition is readable and not True, so the settle quiet-gate doesn't mistake a
-// stable broken state (e.g. ProxyGroupAvailable False while Ready stays True) for
-// convergence.
-func nonTrueResources(t *testing.T, resources []testResource) []string {
-	var bad []string
-	for _, m := range resources {
-		if c, ok := m.condProbe(t); ok && c.Status != metav1.ConditionTrue {
-			bad = append(bad, fmt.Sprintf("%s: Ready=%s (reason=%s)", m.name, c.Status, c.Reason))
-		}
-		if m.objConds != nil && len(m.secondaryConds) > 0 {
-			if conds, ok := m.objConds(t); ok {
-				for _, want := range m.secondaryConds {
-					if c, ok := findCond(conds, want); ok && c.Status != metav1.ConditionTrue {
-						bad = append(bad, fmt.Sprintf("%s: %s=%s (reason=%s)", m.name, want, c.Status, c.Reason))
-					}
+				c, ok := r.condProbe(t)
+				transitions := states[r.name].transitions
+				if ok && c.Status != metav1.ConditionTrue {
+					problems = append(problems, fmt.Sprintf("%s: Ready=%s (reason=%s) and still churning (%d transitions)", r.name, c.Status, c.Reason, transitions))
+				} else if transitions > 2 {
+					problems = append(problems, fmt.Sprintf("%s: Ready condition transitioned %d times and did not settle", r.name, transitions))
 				}
 			}
+			if len(problems) == 0 {
+				problems = append(problems, fmt.Sprintf("stack did not go quiet for %s within %s (last change %s ago)", quietFor, window, time.Since(lastChange).Round(time.Second)))
+			}
+			failAll(t, "stack did not converge", problems)
 		}
 	}
-	return bad
 }
 
 // failAll reports each problem under a shared prefix and fails the test.
@@ -1154,6 +1108,7 @@ const updateTimeout = 5 * time.Minute
 func requireManagedWorkloadsUpdated(t *testing.T, toTag string, preRevisions map[string]string) {
 	t.Helper()
 	start := time.Now()
+	loggedDone := -1 // last reported count, so we log progress only as it climbs.
 	if err := tstest.WaitFor(updateTimeout, func() error {
 		var stsList appsv1.StatefulSetList
 		if err := kubeClient.List(t.Context(), &stsList,
@@ -1165,40 +1120,61 @@ func requireManagedWorkloadsUpdated(t *testing.T, toTag string, preRevisions map
 		if len(stsList.Items) == 0 {
 			return fmt.Errorf("no managed StatefulSets found yet")
 		}
+		var firstErr error
+		done := 0
 		for _, sts := range stsList.Items {
-			want := int32(1)
-			if sts.Spec.Replicas != nil {
-				want = *sts.Spec.Replicas
-			}
-			s := sts.Status
-			if s.ObservedGeneration != sts.Generation {
-				return fmt.Errorf("STS %s: observedGeneration %d != generation %d", sts.Name, s.ObservedGeneration, sts.Generation)
-			}
-			if s.UpdateRevision != "" && s.CurrentRevision != s.UpdateRevision {
-				return fmt.Errorf("STS %s: still rolling (currentRevision %q != updateRevision %q)", sts.Name, s.CurrentRevision, s.UpdateRevision)
-			}
-			// A pre-existing workload whose revision is unchanged means the new
-			// operator never updated it. New workloads (not in the snapshot) are exempt.
-			if pre, existed := preRevisions[sts.Name]; existed && pre != "" && s.CurrentRevision == pre {
-				return fmt.Errorf("STS %s: revision unchanged across the version change (still %q); new operator did not update it", sts.Name, pre)
-			}
-			if toTag != "" {
-				if img, ok := tailscaleContainerImage(&sts); ok && !strings.HasSuffix(img, ":"+toTag) {
-					return fmt.Errorf("STS %s: proxy image %q does not carry to-version tag %q", sts.Name, img, toTag)
+			if err := managedStatefulSetUpdated(&sts, toTag, preRevisions); err != nil {
+				if firstErr == nil {
+					firstErr = err
 				}
+				continue
 			}
-			if s.UpdatedReplicas != want {
-				return fmt.Errorf("STS %s: updatedReplicas %d != desired %d", sts.Name, s.UpdatedReplicas, want)
-			}
-			if s.ReadyReplicas != want {
-				return fmt.Errorf("STS %s: readyReplicas %d != desired %d", sts.Name, s.ReadyReplicas, want)
-			}
+			done++
 		}
-		return nil
+		if done != loggedDone {
+			t.Logf("managed workloads updated: %d/%d (%s elapsed)", done, len(stsList.Items), time.Since(start).Round(time.Second))
+			loggedDone = done
+		}
+		return firstErr
 	}); err != nil {
 		t.Fatalf("waiting for managed workloads to update to the new revision within %s: %v", updateTimeout, err)
 	}
 	t.Logf("all managed workloads updated to the new revision in %s", time.Since(start).Round(time.Second))
+}
+
+// managedStatefulSetUpdated reports whether a managed StatefulSet has rolled to a
+// new revision (vs preRevisions) carrying the to-version image and is ready,
+// returning the first unmet condition as an error otherwise. toTag "" skips the
+// image-tag check but keeps the revision check.
+func managedStatefulSetUpdated(sts *appsv1.StatefulSet, toTag string, preRevisions map[string]string) error {
+	want := int32(1)
+	if sts.Spec.Replicas != nil {
+		want = *sts.Spec.Replicas
+	}
+	s := sts.Status
+	if s.ObservedGeneration != sts.Generation {
+		return fmt.Errorf("STS %s: observedGeneration %d != generation %d", sts.Name, s.ObservedGeneration, sts.Generation)
+	}
+	if s.UpdateRevision != "" && s.CurrentRevision != s.UpdateRevision {
+		return fmt.Errorf("STS %s: still rolling (currentRevision %q != updateRevision %q)", sts.Name, s.CurrentRevision, s.UpdateRevision)
+	}
+	// A pre-existing workload whose revision is unchanged means the new
+	// operator never updated it. New workloads (not in the snapshot) are exempt.
+	if pre, existed := preRevisions[sts.Name]; existed && pre != "" && s.CurrentRevision == pre {
+		return fmt.Errorf("STS %s: revision unchanged across the version change (still %q); new operator did not update it", sts.Name, pre)
+	}
+	if toTag != "" {
+		if img, ok := tailscaleContainerImage(sts); ok && !strings.HasSuffix(img, ":"+toTag) {
+			return fmt.Errorf("STS %s: proxy image %q does not carry to-version tag %q", sts.Name, img, toTag)
+		}
+	}
+	if s.UpdatedReplicas != want {
+		return fmt.Errorf("STS %s: updatedReplicas %d != desired %d", sts.Name, s.UpdatedReplicas, want)
+	}
+	if s.ReadyReplicas != want {
+		return fmt.Errorf("STS %s: readyReplicas %d != desired %d", sts.Name, s.ReadyReplicas, want)
+	}
+	return nil
 }
 
 // tailscaleContainerImage returns the StatefulSet's tailscale container image,
