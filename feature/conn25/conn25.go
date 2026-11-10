@@ -303,8 +303,8 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 	return nil
 }
 
-// ClientTransitIPForMagicIP returns the Transit IP currently assigned to m, if
-// any. It is a pure lookup: callers that are about to install a flow for the
+// ClientTransitIPForMagicIP returns the Transit IP currently assigned to magic IP.
+// It is a pure lookup: callers that are about to install a flow for the
 // result must use [Conn25.ClientFlowCreatedForMagicIP] instead, so that the
 // assignment is pinned by the same lock acquisition that resolves it.
 func (c *Conn25) ClientTransitIPForMagicIP(m netip.Addr) (netip.Addr, error) {
@@ -315,7 +315,7 @@ func (c *Conn25) ClientTransitIPForMagicIP(m netip.Addr) (netip.Addr, error) {
 }
 
 // ClientFlowCreatedForMagicIP implements [Conn25Datapath].
-// The datapath notifies Conn25 that a flow to m is being established, and
+// The datapath notifies Conn25 that a flow to magic IP is being established, and
 // Conn25 resolves m to its Transit IP and counts the flow against that address
 // assignment in one step, returning the hold that names that Transit IP and
 // keeps it and its associated addresses from being removed from Conn25's state
@@ -330,8 +330,7 @@ func (c *Conn25) ClientFlowCreatedForMagicIP(m netip.Addr) (ClientFlowHold, erro
 // unassignedMagicIPErr classifies a magic IP that has no active address
 // assignment. It returns [ErrUnmappedMagicIP] if m falls in a configured Magic
 // IP range, and a nil error if it does not, since in that case m is not a Magic
-// IP at all and the traffic to it is potentially valid non-app-connector
-// traffic.
+// IP at all and the traffic to it is potentially valid non-app-connector traffic.
 func (c *Conn25) unassignedMagicIPErr(m netip.Addr) error {
 	cfg, ok := c.getConfig()
 	if !ok {

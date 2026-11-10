@@ -281,29 +281,14 @@ func (c *client) enqueueAddressAssignment(addrs *addrs) error {
 	}
 }
 
-// ClientFlowHold is a client-side flow's hold on the address assignment it was
-// counted against. It carries the Transit IP the flow was counted against, and
-// is the only way to obtain that address, so a flow cannot be forwarded to a
-// Transit IP without holding the assignment it belongs to against reclamation.
-//
-// Release must be called once the flow is gone, or right away if the caller
-// ends up installing no flow at all. Copies of a hold share one hold on the
-// assignment, not one each.
-//
-// The zero value holds nothing: its Transit IP is invalid and releasing it does
-// nothing, which is what resolving a Magic IP with no assignment returns.
+// ClientFlowHold is a client-side flow's hold on the address assignment it was counted against.
 type ClientFlowHold struct {
 	transit netip.Addr
+	// Release must be called once the flow is gone, or right away if the caller
+	// ends up installing no flow at all.
 	release func()
 }
 
-// TransitIP returns the Transit IP the flow was counted against, which is the
-// only address the flow may be forwarded to. It is invalid if h holds nothing.
-func (h ClientFlowHold) TransitIP() netip.Addr { return h.transit }
-
-// Release releases the flow's hold on its address assignment, letting the
-// assignment be reclaimed once nothing else holds it. It takes effect at most
-// once; later calls, and calls on a hold that holds nothing, do nothing.
 func (h ClientFlowHold) Release() {
 	if h.release != nil {
 		h.release()
@@ -314,12 +299,6 @@ func (h ClientFlowHold) Release() {
 // to it and records that a flow is being established against that assignment,
 // returning the hold that both names that transit IP and keeps the assignment
 // from being reclaimed. It reports whether magicIP had an assignment at all.
-//
-// Resolving and counting share one critical section deliberately. Done as two
-// steps, a concurrent [client.reserveAddresses] can expire the assignment in
-// between and hand its transit IP to an unrelated destination, leaving the
-// caller to install a flow that forwards to a transit IP the assignment no
-// longer owns.
 func (c *client) flowCreatedForMagicIP(magicIP netip.Addr) (ClientFlowHold, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

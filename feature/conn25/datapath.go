@@ -45,18 +45,6 @@ type Conn25Datapath interface {
 	// names the Transit IP to forward that flow to and keeps that address from
 	// being reclaimed, which the caller releases when the flow is removed, or
 	// right away if it ends up installing no flow at all.
-	//
-	// Resolving the Transit IP is part of this call rather than a separate
-	// lookup so that implementations can pin the assignment against expiry as
-	// they resolve it, which is why the address is reachable only through the
-	// hold.
-	//
-	// If magicIP is within a configured Magic IP range for an app on the client,
-	// but has no active address assignment, implementations should return
-	// [ErrUnmappedMagicIP]. If magicIP is not within a configured Magic IP range,
-	// i.e. it is not actually a Magic IP, implementations should return a nil
-	// error and a hold with an invalid Transit IP, to indicate this potentially
-	// valid, non-app-connector traffic.
 	ClientFlowCreatedForMagicIP(magicIP netip.Addr) (ClientFlowHold, error)
 }
 
@@ -260,7 +248,7 @@ func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed, tun *tstu
 	}
 
 	// If this is normal non-app-connector traffic, forward it along unmodified.
-	transitIP := hold.TransitIP()
+	transitIP := hold.transit
 	if !transitIP.IsValid() {
 		hold.Release()
 		return filter.Accept
