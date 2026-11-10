@@ -9435,6 +9435,99 @@ func TestPolicyChangeNotifiesWatcher(t *testing.T) {
 	nw.check()
 }
 
+func TestSysPolicyChangeSuspendsSlowConsumer(t *testing.T) {
+	setting.SetDefinitionsForTest(t,
+		setting.NewDefinition(
+			pkey.AdminConsoleVisibility,
+			setting.UserSetting,
+			setting.VisibilityValue,
+		),
+	)
+
+	store := source.NewTestStore(t)
+	rsop.RegisterStoreForTest(t, "TestStore", setting.DeviceScope, store)
+
+	sys := tsd.NewSystem()
+	sys.PolicyClient.Set(testPolicyClient{})
+	b := newTestLocalBackendWithSys(t, sys)
+	if err := b.Start(ipn.Options{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	ctx := t.Context()
+	watchAdded := make(chan struct{})
+	releaseFirstNotify := make(chan struct{})
+	got := make(chan *ipn.Notify, 256)
+
+	go b.WatchNotificationsAs(
+		ctx,
+		nil,
+		ipn.NotifyInitialState|ipn.NotifySysPolicyChanges|ipn.NotifySuspendWhenBehind,
+		func() { close(watchAdded) },
+		func(n *ipn.Notify) bool {
+			select {
+			case <-releaseFirstNotify:
+			default:
+				<-releaseFirstNotify
+			}
+			got <- n
+			return true
+		},
+	)
+	<-watchAdded
+
+	next := func() *ipn.Notify {
+		t.Helper()
+		select {
+		case n := <-got:
+			return n
+		case <-time.After(10 * time.Second):
+			t.Fatal("timeout waiting for notification")
+			return nil
+		}
+	}
+
+	running := ipn.Running
+	for range 128 {
+		b.send(ipn.Notify{State: &running})
+	}
+	store.SetStrings(
+		source.TestSettingOf(pkey.AdminConsoleVisibility, "hide"),
+	)
+
+	close(releaseFirstNotify)
+
+	ini := next()
+	if ini.SessionID == "" {
+		t.Fatalf("initial notification = %v; want SessionID", ini)
+	}
+
+	for {
+		n := next()
+		if n.Suspended {
+			break
+		}
+		if n.State == nil || *n.State != ipn.Running {
+			t.Fatalf("notification before suspension = %v; want Running", n)
+		}
+	}
+
+	if err := b.ResumeWatchNotifications(ctx, ini.SessionID); err != nil {
+		t.Fatalf("ResumeWatchNotifications: %v", err)
+	}
+
+	n := next()
+	if n.Suspended || n.SessionID != ini.SessionID {
+		t.Fatalf("after resume got %v; want initial notification", n)
+	}
+	if n.Policy == nil {
+		t.Fatal("resmed notification has no policy")
+	}
+	if value := n.Policy.Get(pkey.AdminConsoleVisibility); fmt.Sprint(value) != "hide" {
+		t.Errorf("resumed policy = %v; want hide", value)
+	}
+}
+
 func TestPolicyNotifyPerUser(t *testing.T) {
 	setting.SetDefinitionsForTest(t,
 		setting.NewDefinition(
