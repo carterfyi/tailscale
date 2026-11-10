@@ -29,9 +29,9 @@ type testConn25 struct {
 	connectorRealIPForTransitIPConnectionFn func(netip.Addr, netip.Addr) (netip.Addr, error)
 }
 
-func (tc *testConn25) ClientFlowCreatedForMagicIP(magicIP netip.Addr) (netip.Addr, func(), error) {
+func (tc *testConn25) ClientFlowCreatedForMagicIP(magicIP netip.Addr) (ClientFlowHold, error) {
 	transitIP, err := tc.clientTransitIPForMagicIPFn(magicIP)
-	return transitIP, func() {}, err
+	return ClientFlowHold{transit: transitIP}, err
 }
 
 func (tc *testConn25) ConnectorRealIPForTransitIPConnection(srcIP netip.Addr, transitIP netip.Addr) (netip.Addr, error) {

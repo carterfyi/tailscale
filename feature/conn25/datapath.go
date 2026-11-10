@@ -41,25 +41,23 @@ type Conn25Datapath interface {
 	ConnectorRealIPForTransitIPConnection(srcIP netip.Addr, transitIP netip.Addr) (netip.Addr, error)
 
 	// ClientFlowCreatedForMagicIP is called before a client-side flow to
-	// magicIP is installed in the client flow table. It returns the Transit IP
-	// to forward that flow to, and a cleanup function that the caller must
-	// invoke when that flow is removed. The cleanup takes effect at most once;
-	// implementations must ignore repeat calls rather than release the flow's
-	// hold on its address assignment more than once.
+	// magicIP is installed in the client flow table. It returns the hold that
+	// names the Transit IP to forward that flow to and keeps that address from
+	// being reclaimed, which the caller releases when the flow is removed, or
+	// right away if it ends up installing no flow at all.
 	//
 	// Resolving the Transit IP is part of this call rather than a separate
 	// lookup so that implementations can pin the assignment against expiry as
-	// they resolve it. The returned Transit IP is the one the flow was counted
-	// against, and is the only one the caller may forward the flow to.
+	// they resolve it, which is why the address is reachable only through the
+	// hold.
 	//
 	// If magicIP is within a configured Magic IP range for an app on the client,
 	// but has no active address assignment, implementations should return
 	// [ErrUnmappedMagicIP]. If magicIP is not within a configured Magic IP range,
 	// i.e. it is not actually a Magic IP, implementations should return a nil
-	// error and a zero-value [netip.Addr] to indicate this potentially valid,
-	// non-app-connector traffic. In both cases no flow is counted and the
-	// returned cleanup is a no-op.
-	ClientFlowCreatedForMagicIP(magicIP netip.Addr) (transitIP netip.Addr, cleanup func(), err error)
+	// error and a hold with an invalid Transit IP, to indicate this potentially
+	// valid, non-app-connector traffic.
+	ClientFlowCreatedForMagicIP(magicIP netip.Addr) (ClientFlowHold, error)
 }
 
 // datapathHandler handles packets from the datapath,
@@ -247,8 +245,10 @@ func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed, tun *tstu
 	// flow in between, and guarantees that ClientFlowCreatedForMagicIP for this
 	// flow precedes the cleanup that fires when it is removed.
 	magicIP := p.Dst.Addr()
-	transitIP, flowCleanup, err := dh.conn25.ClientFlowCreatedForMagicIP(magicIP)
+	hold, err := dh.conn25.ClientFlowCreatedForMagicIP(magicIP)
 	if err != nil {
+		// Nothing is installed on this path, so the hold goes back right away.
+		hold.Release()
 		if errors.Is(err, ErrUnmappedMagicIP) {
 			// Couldn't find a mapping. Tell the local application the host is
 			// unreachable so it can recover quickly instead of blackholing.
@@ -260,7 +260,9 @@ func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed, tun *tstu
 	}
 
 	// If this is normal non-app-connector traffic, forward it along unmodified.
+	transitIP := hold.TransitIP()
 	if !transitIP.IsValid() {
+		hold.Release()
 		return filter.Accept
 	}
 
@@ -279,7 +281,7 @@ func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed, tun *tstu
 	dh.clientFlowTable.NewFlow(FlowData{
 		FromTun:  outgoing,
 		FromWG:   incoming,
-		OnRemove: flowCleanup,
+		OnRemove: hold.Release,
 	})
 	outgoing.Action(p)
 	return filter.Accept

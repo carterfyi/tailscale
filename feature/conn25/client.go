@@ -281,27 +281,56 @@ func (c *client) enqueueAddressAssignment(addrs *addrs) error {
 	}
 }
 
+// ClientFlowHold is a client-side flow's hold on the address assignment it was
+// counted against. It carries the Transit IP the flow was counted against, and
+// is the only way to obtain that address, so a flow cannot be forwarded to a
+// Transit IP without holding the assignment it belongs to against reclamation.
+//
+// Release must be called once the flow is gone, or right away if the caller
+// ends up installing no flow at all. Copies of a hold share one hold on the
+// assignment, not one each.
+//
+// The zero value holds nothing: its Transit IP is invalid and releasing it does
+// nothing, which is what resolving a Magic IP with no assignment returns.
+type ClientFlowHold struct {
+	transit netip.Addr
+	release func()
+}
+
+// TransitIP returns the Transit IP the flow was counted against, which is the
+// only address the flow may be forwarded to. It is invalid if h holds nothing.
+func (h ClientFlowHold) TransitIP() netip.Addr { return h.transit }
+
+// Release releases the flow's hold on its address assignment, letting the
+// assignment be reclaimed once nothing else holds it. It takes effect at most
+// once; later calls, and calls on a hold that holds nothing, do nothing.
+func (h ClientFlowHold) Release() {
+	if h.release != nil {
+		h.release()
+	}
+}
+
 // flowCreatedForMagicIP resolves magicIP to the transit IP currently assigned
 // to it and records that a flow is being established against that assignment,
-// returning the transit IP and the cleanup that releases the flow's hold on it.
-// It reports whether magicIP had an assignment at all.
+// returning the hold that both names that transit IP and keeps the assignment
+// from being reclaimed. It reports whether magicIP had an assignment at all.
 //
 // Resolving and counting share one critical section deliberately. Done as two
 // steps, a concurrent [client.reserveAddresses] can expire the assignment in
 // between and hand its transit IP to an unrelated destination, leaving the
 // caller to install a flow that forwards to a transit IP the assignment no
 // longer owns.
-func (c *client) flowCreatedForMagicIP(magicIP netip.Addr) (netip.Addr, func(), bool) {
+func (c *client) flowCreatedForMagicIP(magicIP netip.Addr) (ClientFlowHold, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.assignments.lookupByMagicIP(magicIP)
 	if !ok {
-		return netip.Addr{}, func() {}, false
+		return ClientFlowHold{}, false
 	}
 	transit := entry.connectorAddr.transit
 	entry.activeFlowCount++
 	var released bool
-	return transit, func() {
+	return ClientFlowHold{transit: transit, release: func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if released {
@@ -316,7 +345,7 @@ func (c *client) flowCreatedForMagicIP(magicIP netip.Addr) (netip.Addr, func(), 
 		if entry.activeFlowCount == 0 {
 			entry.zeroFlowTime = c.assignments.clock.Now()
 		}
-	}, true
+	}}, true
 }
 
 func (c *client) extraWireGuardAllowedIPs(k key.NodePublic) views.Slice[netip.Prefix] {
